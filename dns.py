@@ -13,11 +13,15 @@ import random
 import socket
 import struct
 from dataclasses import dataclass
+from typing import Optional
 
 # For reproducibility during tests
 random.seed(1)
 
+DNS_PORT = 53
 TYPE_A = 1
+TYPE_TXT = 16
+TYPE_NS = 2
 CLASS_IN = 1
 
 
@@ -76,8 +80,7 @@ def encode_dns_name(domain_name: str) -> bytes:
 def build_query(domain_name: str, record_type: int) -> bytes:
     name = encode_dns_name(domain_name)
     id = random.randint(0, 65535)
-    RECURSION_DESIRED = 1 << 8
-    header = DNSHeader(id=id, num_questions=1, flags=RECURSION_DESIRED)
+    header = DNSHeader(id=id, num_questions=1, flags=0)
     question = DNSQuestion(name=name, type_=record_type, class_=CLASS_IN)
     return header_to_bytes(header) + question_to_bytes(question)
 
@@ -133,7 +136,12 @@ def parse_record(reader: io.IOBase) -> DNSRecord:
     # the type, TTL and data length are 10 bytes in total (2 + 2 + 4 + 2)
     data = reader.read(10)
     type_, class_, ttl, data_len = struct.unpack("!HHIH", data)
-    data = reader.read(data_len)
+    if type_ == TYPE_NS:
+        data = decode_name(reader)
+    elif type_ == TYPE_A:
+        data = ip_to_string(reader.read(data_len))
+    else:
+        data = reader.read(data_len)
     return DNSRecord(name, type_, class_, ttl, data)
 
 
@@ -153,19 +161,78 @@ def ip_to_string(ip: bytes) -> str:
 
 
 def lookup_domain(domain_name: str) -> str:
-    query = build_query(domain_name, TYPE_A)
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.sendto(query, ("8.8.8.8", 53))
-    data, _ = sock.recvfrom(1024)
-    response = parse_dns_packet(data)
+    response = send_query("8.8.8.8", domain_name, TYPE_A)
     return ip_to_string(response.answers[0].data)
 
 
+def send_query(ip_address: str, domain_name: str, record_type: int) -> DNSPacket:
+    query = build_query(domain_name, record_type)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.sendto(query, (ip_address, DNS_PORT))
+
+    data, _ = sock.recvfrom(1024)
+    return parse_dns_packet(data)
+
+
+# Resolver
+def get_answer(packet: DNSPacket) -> Optional[str]:
+    # Return the first A record in the answer section
+    for a in packet.answers:
+        if a.type_ == TYPE_A:
+            return str(a.data)
+    return None
+
+
+def get_nameserver_ip(packet: DNSPacket) -> Optional[str]:
+    # Return the first A record in the additional section
+    for a in packet.additionals:
+        if a.type_ == TYPE_A:
+            return str(a.data)
+    return None
+
+
+def get_nameserver(packet: DNSPacket) -> Optional[str]:
+    for a in packet.authorities:
+        if a.type_ == TYPE_NS:
+            return a.data.decode("utf-8")
+    return None
+
+
+def resolve_wrong(domain_name: str, record_type: int) -> str:
+    nameserver = "198.41.0.4"
+    while True:
+        print(f"Querying {nameserver} for {domain_name}")
+        response = send_query(nameserver, domain_name, record_type)
+        if ip := get_answer(response):
+            assert ip is not None, "no ip found"
+            return ip
+        elif new_nameserver := get_nameserver_ip(response):
+            assert new_nameserver is not None, "no nameserver ip found"
+            nameserver = new_nameserver
+        else:
+            raise Exception("something went wrong")
+
+
+def resolve(domain_name: str, record_type: int) -> str:
+    nameserver = "198.41.0.4"
+    while True:
+        print(f"Querying {nameserver} for {domain_name}")
+        response = send_query(nameserver, domain_name, record_type)
+        if ip := get_answer(response):
+            assert ip is not None, "no ip found"
+            return ip
+        elif new_nameserver := get_nameserver_ip(response):
+            assert new_nameserver is not None, "no nameserver ip found"
+            nameserver = new_nameserver
+        elif ns_domain := get_nameserver(response):
+            assert ns_domain is not None, "no nameserver domain name found"
+            nameserver = resolve(ns_domain, TYPE_A)
+        else:
+            raise Exception("something went wrong")
+
+
 def main() -> int:
-    print(lookup_domain("www.example.com"))
-    print(lookup_domain("www.google.com"))
-    print(lookup_domain("www.facebook.com"))
-    print(lookup_domain("www.metafilter.com"))
+    print(resolve("twitter.com", TYPE_A))
     return 0
 
 
